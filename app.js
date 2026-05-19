@@ -354,9 +354,67 @@ function makePack(id, title, arr, p, reasons, score){
     score
   };
 }
+function packCandidateBase(p = state){
+  // Para packs, el perfil no debe bloquear oportunidades: si los números dan, se evalúa.
+  // Solo se respeta zona, disponibilidad, tipo residencial y techo mensual duro del usuario.
+  return units
+    .filter(u => isAvailable(u) && hasNumbers(u) && isResidential(u) && zoneOk(u,p))
+    .filter(u => monthlyBudgetOk(u,p))
+    .map(u => scoreUnit(u,p,units))
+    .sort((a,b) => b.score - a.score);
+}
+function maxPackDown(p = state, relax = .18){
+  if(maxCapacity(p)) return 99999999;
+  if(p.product === 'bulk') relax = Math.max(relax, .28);
+  if(p.down === 'dplus') relax = Math.max(relax, .35);
+  return maxDown(p) * (1 + relax);
+}
+function canAddToPack(current, unit, p = state, relax = .18){
+  const nextMonth = (current.cuota || 0) + (asNum(unit.cuota_estimada) || 0);
+  const nextDown = (current.anticipo || 0) + (asNum(unit.anticipo) || 0);
+  if(!monthlyBudgetOkAmount(nextMonth, p)) return false;
+  if(!maxCapacity(p) && nextDown > maxPackDown(p, relax)) return false;
+  return true;
+}
+function buildAffordablePack(list, desiredSize, p = state, relax = .18){
+  const arr = [];
+  const totals = {precio:0, anticipo:0, cuota:0, m2:0, contado:0};
+  const ordered = [...list].sort((a,b) => {
+    // Para presupuestos bajos prioriza cuota baja + precio/m² razonable; para presupuestos altos prioriza score.
+    if(['entry','medium'].includes(capacityLevel(p))){
+      const am = asNum(a.cuota_estimada) || 999999;
+      const bm = asNum(b.cuota_estimada) || 999999;
+      if(Math.abs(am-bm) > 50) return am-bm;
+    }
+    return b.score - a.score;
+  });
+  for(const u of ordered){
+    if(arr.length >= desiredSize) break;
+    if(arr.some(x => x.id === u.id)) continue;
+    if(canAddToPack(totals,u,p,relax)){
+      arr.push(u);
+      totals.precio += asNum(u.precio) || 0;
+      totals.anticipo += asNum(u.anticipo) || 0;
+      totals.cuota += asNum(u.cuota_estimada) || 0;
+      totals.m2 += asNum(u.m2) || 0;
+      totals.contado += asNum(u.precio_contado) || 0;
+    }
+  }
+  return arr.length >= desiredSize ? arr : [];
+}
+function packSizePriority(p = state){
+  if(maxCapacity(p)) return [5,4,3,2];
+  if(p.product === 'bulk') return highCapacity(p) ? [3,2,4,5] : [2,3];
+  if(highCapacity(p) || p.objective === 'grow') return [3,2];
+  return [2,3];
+}
+function packTitleFor(scope, size){
+  if(size >= 5) return `Pack mayorista en ${scope}`;
+  return `Pack con ofertas en ${scope}`;
+}
 function packCandidates(p = state){
-  const base = units.filter(u => isAvailable(u) && hasNumbers(u) && isResidential(u) && zoneOk(u,p));
-  const scored = base.map(u => scoreUnit(u,p,base)).sort((a,b) => b.score - a.score);
+  if(p.product === 'commercial') return [];
+  const scored = packCandidateBase(p);
   const byBarrio = new Map();
   for(const u of scored){
     const b = norm(u.barrio) || 'varios barrios';
@@ -364,57 +422,103 @@ function packCandidates(p = state){
     byBarrio.get(b).push(u);
   }
   const packs = [];
+  const seen = new Set();
+  const sizes = packSizePriority(p);
+  const relax = maxCapacity(p) ? .55 : (p.product === 'bulk' ? .28 : .18);
+
+  function pushPack(scope, arr, baseScore, extraReasons = []){
+    if(!arr || arr.length < 2) return;
+    const key = arr.map(x => x.id).sort().join('|');
+    if(seen.has(key)) return;
+    seen.add(key);
+    const title = packTitleFor(scope, arr.length);
+    const pack = makePack(`PACK-${scope}-${arr.length}-${packs.length}`.replace(/\s+/g,'-'), title, arr, p, [
+      `${arr.length >= 5 ? 'pack mayorista' : 'pack con ofertas'} dentro del presupuesto mensual indicado`,
+      'combinación armada dinámicamente desde unidades disponibles',
+      'puede abrir conversación por condiciones especiales sujetas a disponibilidad',
+      ...extraReasons
+    ], baseScore + arr.length * 14 + (p.product === 'bulk' ? 44 : 0) + (maxCapacity(p) ? 50 : 0));
+    if(pack && packAffordable(pack,p,relax)) packs.push(pack);
+  }
+
+  // Packs por barrio: especialmente importante para Aura/Canning y barrios con mucho stock.
   for(const [barrio, list] of byBarrio.entries()){
     if(list.length < 2) continue;
-    const size = maxCapacity(p) && list.length >= 5 ? 5 : Math.min(3, list.length);
-    const arr = list.slice(0, size);
-    const title = size >= 5 ? `Pack mayorista en ${barrio}` : `Pack con ofertas en ${barrio}`;
-    const pack = makePack(`PACK-${barrio}-${size}`.replace(/\s+/g,'-'), title, arr, p, [
-      `${size >= 5 ? 'pack mayorista' : 'pack con ofertas'} armado dinámicamente desde unidades disponibles`,
-      'puede abrir conversación por condiciones especiales sujetas a disponibilidad',
-      `foco en ${barrio}`
-    ], 135 + size * 12 + (maxCapacity(p) ? 45 : 0) + (p.product === 'bulk' ? 48 : 0));
-    if(pack && packAffordable(pack,p,maxCapacity(p) ? .50 : .18)) packs.push(pack);
+    for(const size of sizes){
+      if(list.length < size) continue;
+      const arr = buildAffordablePack(list, size, p, relax);
+      if(arr.length >= 2){
+        pushPack(barrio, arr, 125, [`foco en ${barrio}`]);
+        break; // un pack principal por barrio para evitar repetición excesiva
+      }
+    }
   }
+
+  // Pack corredor norte diversificado por desarrollo, si entra en presupuesto.
   const cabaNorth = scored.filter(u => norm(u.zona) === 'corredor_norte');
-  if(cabaNorth.length >= 3){
-    const arr = uniqueByDevelopment(cabaNorth, maxCapacity(p) ? 5 : 3);
-    const title = arr.length >= 5 ? 'Pack mayorista corredor norte' : 'Pack con ofertas en corredor norte';
-    const pack = makePack('PACK-CORREDOR-NORTE', title, arr, p, [
-      'combinación de unidades en barrios líquidos del corredor norte',
-      'pensado para diversificación y negociación por cantidad',
-      'condiciones especiales sujetas a disponibilidad y aprobación'
-    ], 160 + (maxCapacity(p) ? 58 : 0) + (p.product === 'bulk' ? 55 : 0));
-    if(pack && packAffordable(pack,p,maxCapacity(p) ? .55 : .20)) packs.push(pack);
+  if(cabaNorth.length >= 2){
+    const diversified = [];
+    const usedDev = new Set();
+    for(const u of cabaNorth){
+      const dev = norm(u.desarrollo);
+      if(!usedDev.has(dev) && canAddToPack(packTotals(diversified),u,p,relax)){
+        diversified.push(u); usedDev.add(dev);
+      }
+      if(diversified.length >= (maxCapacity(p) ? 5 : 3)) break;
+    }
+    if(diversified.length >= 2){
+      pushPack('corredor norte', diversified, 152, [
+        'mezcla unidades de barrios líquidos',
+        'pensado para diversificación sin romper el presupuesto de cuota'
+      ]);
+    }
   }
-  return packs.sort((a,b) => b.score - a.score).slice(0,6);
+
+  return packs
+    .filter(pk => monthlyBudgetOk(pk,p))
+    .sort((a,b) => b.score - a.score)
+    .slice(0,10);
+}
+function addUniqueSelected(selected, item, maxPacks = 2){
+  if(!item) return false;
+  if(selected.some(x => x.id === item.id)) return false;
+  if(item.resultType === 'pack' && selected.filter(x => x.resultType === 'pack').length >= maxPacks) return false;
+  selected.push(item);
+  return true;
 }
 function recommend(p = state){
   let cands = candidateUnits(p,.16);
   if(!cands.length) cands = candidateUnits(p,.36);
   if(!cands.length) cands = units.filter(u => isAvailable(u) && hasNumbers(u) && zoneOk(u,p) && productOk(u,p) && monthlyBudgetOk(u,p));
-  let ranked = cands.map(u => scoreUnit(u,p,cands)).sort((a,b) => b.score - a.score);
+  let ranked = cands.map(u => scoreUnit(u,p,cands)).filter(u => monthlyBudgetOk(u,p)).sort((a,b) => b.score - a.score);
   if(maxCapacity(p)){
     const high = ranked.filter(u => (asNum(u.precio) || 0) >= 170000 || isLocal(u) || isEmprendeprop(u));
     if(high.length >= 3) ranked = high;
   }
   const packs = packCandidates(p);
   const selected = [];
-  if(p.product === 'bulk' || maxCapacity(p)){
-    for(const pk of packs){ if(selected.length >= 3) break; selected.push(pk); }
-  } else if(highCapacity(p) && p.objective === 'grow' && packs.length){
-    selected.push(packs[0]);
+  const maxPacks = (p.product === 'bulk' || maxCapacity(p)) ? 3 : (highCapacity(p) || p.objective === 'grow' ? 2 : 1);
+
+  if(p.product === 'bulk'){
+    for(const pk of packs){ if(selected.length >= 3) break; addUniqueSelected(selected, pk, maxPacks); }
+  } else {
+    // Aunque el perfil no haya pedido packs, si el presupuesto da, mostrar al menos una alternativa de pack.
+    addUniqueSelected(selected, ranked[0], maxPacks);
+    if(packs.length) addUniqueSelected(selected, packs[0], maxPacks);
+    // Mantener variedad: una unidad individual de otro desarrollo/barrio antes de repetir packs.
+    const usedDev = new Set(selected.map(x => norm(x.desarrollo)));
+    const variedUnit = ranked.find(u => !usedDev.has(norm(u.desarrollo)) && !selected.some(x => x.id === u.id));
+    addUniqueSelected(selected, variedUnit || ranked[1], maxPacks);
+    if((highCapacity(p) || p.objective === 'grow') && packs[1]) addUniqueSelected(selected, packs[1], maxPacks);
   }
+
   for(const item of ranked){
     if(selected.length >= 5) break;
-    if(selected.some(x => x.id === item.id)) continue;
-    selected.push(item);
+    addUniqueSelected(selected, item, maxPacks);
   }
-  if(selected.length < 5 && p.product !== 'commercial'){
-    for(const pk of packs){
-      if(selected.length >= 5) break;
-      if(!selected.some(x => x.id === pk.id)) selected.push(pk);
-    }
+  for(const pk of packs){
+    if(selected.length >= 5) break;
+    addUniqueSelected(selected, pk, maxPacks);
   }
   return selected.filter(x => monthlyBudgetOk(x,p)).slice(0,5).map(x => ({...x, roleName: roleName(x,p)}));
 }

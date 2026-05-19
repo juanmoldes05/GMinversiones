@@ -1,4 +1,4 @@
-const CACHE_NAME = 'gm-recomendador-json-desplegable-v2-cuota-fix';
+const CACHE_NAME = 'gm-recomendador-json-desplegable-v3-pack-variety';
 const APP_SHELL = [
   './',
   './index.html',
