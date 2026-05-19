@@ -1,6 +1,6 @@
 {
-  "name": "GM Recomendador Final",
-  "short_name": "GM Final",
+  "name": "Grupo Moldes | Recomendador privado",
+"short_name": "GM Inversiones"
   "start_url": "./index.html",
   "display": "standalone",
   "background_color": "#f7f3f1",
